@@ -1,4 +1,4 @@
-# @jescrich/nestjs-kafka-client
+# NestJS Kafka - Enterprise Client
 
 A production-ready NestJS module for Kafka client and consumer functionality built on top of [kafkajs](https://kafka.js.org/). This library provides enterprise-grade features including intelligent batch processing, idempotency guarantees, key-based grouping, and automatic pressure management.
 
