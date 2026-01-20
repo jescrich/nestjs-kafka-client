@@ -37,15 +37,14 @@ import { KafkaModule, ConsumerModule } from '@jescrich/nestjs-kafka-client';
 
 @Module({
   imports: [
-    KafkaModule.forRoot({
+    KafkaModule.register({
       clientId: 'my-app',
-      brokers: ['localhost:9092'],
-      // Advanced kafkajs configuration is supported
-      ssl: true,
-      sasl: {
-        mechanism: 'plain',
-        username: 'your-username',
-        password: 'your-password',
+      brokers: 'localhost:9092', // String with comma-separated brokers
+      options: {
+        maxConcurrency: 5,
+        batchSizeMultiplier: 10,
+        enableCpuMonitoring: true,
+        messageRetryLimit: 3,
       },
     }),
     ConsumerModule,
@@ -241,25 +240,43 @@ export class HealthController {
 ### KafkaModule Configuration
 
 ```typescript
-KafkaModule.forRoot({
-  // Standard kafkajs options
+KafkaModule.register({
+  // Required
   clientId: 'my-app',
-  brokers: ['localhost:9092'],
+  brokers: 'localhost:9092', // String with comma-separated brokers
   
-  // Advanced connection management
-  connectionTimeout: 3000,
-  requestTimeout: 30000,
-  retry: {
-    initialRetryTime: 100,
-    retries: 8
-  },
+  // Optional: Unique identifier for this microservice
+  serviceId: 'my-service',
   
-  // Production settings
-  ssl: true,
-  sasl: {
-    mechanism: 'scram-sha-256',
-    username: process.env.KAFKA_USERNAME,
-    password: process.env.KAFKA_PASSWORD,
+  // Optional: Advanced options
+  options: {
+    // Concurrency Management
+    maxConcurrency: 5,              // Default: Math.floor(cpus().length / 2)
+    batchSizeMultiplier: 10,        // Default: 10
+    
+    // Connection Management
+    connectionRetryDelay: 5000,     // Default: 5000ms
+    connectionMaxRetries: 10,       // Default: 10
+    
+    // Resource Monitoring
+    enableCpuMonitoring: true,      // Default: true
+    enableMemoryMonitoring: true,   // Default: false
+    memoryLogLevel: 'info',         // 'debug' | 'info' | 'warn'
+    containerMemoryLimitMB: 512,    // Auto-detect from env vars
+    
+    // Message Processing
+    messageRetryLimit: 3,           // Default: 3
+    messageRetryDelayMs: 30000,     // Default: 30000ms
+    dlqSuffix: '-dlq',              // Default: '-dlq'
+    
+    // Consumer Configuration
+    fromBeginning: false,           // Default: false
+    sessionTimeout: 30000,          // Default: 30000ms
+    heartbeatInterval: 10000,       // Default: 10000ms
+    
+    // Batch Processing
+    batchAccumulationDelayMs: 100,  // Delay to accumulate messages
+    minBatchSize: 1,                // Minimum batch size before processing
   }
 })
 ```
