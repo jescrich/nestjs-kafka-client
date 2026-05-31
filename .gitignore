@@ -1,4 +1,15 @@
 dist
 node_modules
-**.tsbuildinfo
+
+# Build artifacts
+*.tsbuildinfo
+
+# OS files
 .DS_Store
+**/.DS_Store
+
+# Editor / tooling
+.vscode/
+.cursor/
+.cursorrules
+.kiro/

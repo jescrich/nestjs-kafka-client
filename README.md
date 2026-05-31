@@ -277,6 +277,33 @@ KafkaModule.register({
     // Batch Processing
     batchAccumulationDelayMs: 100,  // Delay to accumulate messages
     minBatchSize: 1,                // Minimum batch size before processing
+
+    // Retry Backoff (consumer redelivery)
+    retryBackoffStrategy: 'exponential', // 'fixed' | 'exponential' (default: 'exponential')
+    retryBackoffMaxMs: 30000,            // Cap for exponential backoff (default: 30000ms)
+
+    // Idempotent Producer
+    producerIdempotent: false,           // Enable idempotent producer (default: false)
+    producerMaxInFlightRequests: 5,      // Required <= 5 when idempotent (default: 5)
+    producerTransactionalId: undefined,  // Optional; implies idempotent
+    producerAcks: -1,                    // Acks per send (default: -1 / all)
+
+    // Cold-boot: ensure topics exist
+    ensureTopicsOnConnect: false,        // Create subscribed topics before consuming (default: false)
+    autoCreateDlqTopics: true,           // Also create `${topic}${dlqSuffix}` (default: true)
+    topicsToEnsure: [                    // Explicit topics to create on init (producer-only topics)
+      { topic: 'orders', numPartitions: 3, replicationFactor: 1 },
+    ],
+    defaultNumPartitions: 1,             // Default partitions for ensured topics (default: 1)
+    defaultReplicationFactor: 1,         // Default replication for ensured topics (default: 1)
+
+    // Idempotency / dedup (skip already-processed messages)
+    idempotencyStore: new InMemoryIdempotencyStore({ ttlMs: 3_600_000 }), // pluggable (Redis/DB)
+    idempotencyKeyExtractor: (msg, topic) => msg.headers?.['x-message-id']?.toString() ?? null,
+
+    // Envelope contract (optional message envelope)
+    useEnvelope: false,                  // Unwrap KafkaEnvelope before handing to handler (default: false)
+    validateEnvelopeOnConsume: false,    // Reject invalid envelopes to DLQ (default: false)
   }
 })
 ```
@@ -313,6 +340,91 @@ KafkaModule.register({
   sessionTimeout: 30000,
   heartbeatInterval: 3000,
 })
+```
+
+## Enterprise Features
+
+### Exponential Retry Backoff
+
+When a message fails with a retryable error, the consumer now pauses the affected
+topic-partition for an exponentially increasing delay (base = `messageRetryDelayMs`,
+doubling per attempt, with jitter, capped at `retryBackoffMaxMs`) before the offset is
+redelivered. Set `retryBackoffStrategy: 'fixed'` to keep a constant delay.
+
+### Idempotent Producer
+
+```typescript
+KafkaModule.register({
+  clientId: 'my-app',
+  brokers: 'localhost:9092',
+  options: {
+    producerIdempotent: true,        // exactly-once-ish delivery to the broker
+    producerMaxInFlightRequests: 5,  // must be <= 5 when idempotent
+    producerAcks: -1,                // wait for all in-sync replicas
+    // producerTransactionalId: 'my-app-tx', // optional; implies idempotent
+  },
+});
+```
+
+### Cold-boot Topic Creation (`ensureTopics`)
+
+```typescript
+// Auto-create subscribed topics (and their DLQ) before consuming:
+options: { ensureTopicsOnConnect: true, autoCreateDlqTopics: true }
+
+// Or create producer-only topics on startup:
+options: {
+  topicsToEnsure: [{ topic: 'orders', numPartitions: 3, replicationFactor: 3 }],
+}
+
+// Programmatically:
+await kafkaClient.ensureTopics([{ topic: 'orders', numPartitions: 3 }]);
+```
+
+### Idempotency / Dedup
+
+A pluggable `IdempotencyStore` lets the consumer skip messages it has already processed.
+A default in-memory implementation is provided; swap it for Redis/DB in production.
+
+```typescript
+import { InMemoryIdempotencyStore } from '@jescrich/nestjs-kafka-client';
+
+options: {
+  idempotencyStore: new InMemoryIdempotencyStore({ ttlMs: 3_600_000, maxEntries: 100_000 }),
+  // The id resolves from (in order): idempotencyKeyExtractor → envelope.eventId →
+  // header `x-message-id` / `x-event-id`. If no id is found, dedup is skipped.
+  idempotencyKeyExtractor: (msg, topic) => msg.headers?.['x-message-id']?.toString() ?? null,
+}
+```
+
+```typescript
+// Custom store contract:
+interface IdempotencyStore {
+  isProcessed(messageId: string): Promise<boolean>;
+  markProcessed(messageId: string, ttlMs?: number): Promise<void>;
+}
+```
+
+### Message Envelope Contract
+
+An optional, generic envelope standardizes event metadata (id, type, tenant, version,
+trace). When `useEnvelope` is enabled, the consumer unwraps it and hands the inner
+`payload` to your handler; `envelope.eventId` is used as the default idempotency id.
+
+```typescript
+import { createEnvelope, KafkaEnvelope } from '@jescrich/nestjs-kafka-client';
+
+// Producer side:
+const envelope = createEnvelope({ orderId: 42 }, {
+  eventType: 'order.created',
+  tenant: 'acme',
+  traceId: 'abc-123',
+});
+await kafkaClient.produce('orders', 'order-42', envelope);
+
+// Consumer side:
+options: { useEnvelope: true, validateEnvelopeOnConsume: true }
+// Invalid envelopes are routed to the DLQ (non-retryable).
 ```
 
 ## Performance Benefits

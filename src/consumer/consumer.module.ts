@@ -1,6 +1,7 @@
 import { DynamicModule, Logger, Module, Type } from '@nestjs/common';
+import { KafkaMessage } from '@nestjs/microservices/external/kafka.interface';
 import { ConsumerService } from './consumer.service';
-import { KafkaClient, KafkaModule } from '@this/kafka';
+import { KafkaClient, KafkaModule, TopicToEnsure, IdempotencyStore } from '@this/kafka';
 import { ModuleRef } from '@nestjs/core';
 import { ConsumerRefService } from './consumer.ref';
 import { ConsumerHealthIndicator } from './consumer.health';
@@ -29,6 +30,21 @@ export class ConsumerModule {
       heartbeatInterval?: number;
       batchAccumulationDelayMs?: number;
       minBatchSize?: number;
+      producerIdempotent?: boolean;
+      producerMaxInFlightRequests?: number;
+      producerTransactionalId?: string;
+      producerAcks?: number;
+      ensureTopicsOnConnect?: boolean;
+      topicsToEnsure?: TopicToEnsure[];
+      autoCreateDlqTopics?: boolean;
+      defaultNumPartitions?: number;
+      defaultReplicationFactor?: number;
+      retryBackoffStrategy?: 'fixed' | 'exponential';
+      retryBackoffMaxMs?: number;
+      idempotencyStore?: IdempotencyStore;
+      idempotencyKeyExtractor?: (message: KafkaMessage, topic: string) => string | null;
+      useEnvelope?: boolean;
+      validateEnvelopeOnConsume?: boolean;
     };
   }): DynamicModule {
     const { name, consumers, providers } = params;

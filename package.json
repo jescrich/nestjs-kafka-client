@@ -20,7 +20,11 @@
     "test": "jest --config jest.config.cjs --no-watchman",
     "test:watch": "jest --watch --config jest.config.cjs --no-watchman",
     "test:cov": "jest --coverage --config jest.config.cjs --no-watchman",
-    "test:kafka": "jest --config jest.config.cjs test/kafka/ test/consumer/ --no-watchman"
+    "test:kafka": "jest --config jest.config.cjs test/kafka/ test/consumer/ --no-watchman",
+    "test:kafka-unit-bug": "jest --config jest.config.cjs test/kafka/kafka.client.unit-bug-test.spec.ts --no-watchman",
+    "test:kafka-bug": "ts-node test/kafka/bug-reproduction-test.ts",
+    "test:kafka-integration": "jest --config jest.config.cjs test/kafka/kafka.client.integration.spec.ts --testTimeout=60000 --no-watchman",
+    "test:kafka-interactive": "./scripts/test-kafka-bug.sh"
   },
   "peerDependencies": {
     "@nestjs/common": "^11.0.1",

@@ -1,6 +1,8 @@
 import { DynamicModule, Global, Module } from '@nestjs/common';
+import { KafkaMessage } from '@nestjs/microservices/external/kafka.interface';
 import { randomUUID } from 'crypto';
-import { KafkaClient } from './kafka.client';
+import { KafkaClient, TopicToEnsure } from './kafka.client';
+import { IdempotencyStore } from './idempotency.store';
 import { KafkaConnectionManager } from './kafka.connection.manager';
 import { KafkaHealthIndicator } from './kafka.health';
 
@@ -28,6 +30,21 @@ export class KafkaModule {
       heartbeatInterval?: number;
       batchAccumulationDelayMs?: number;
       minBatchSize?: number;
+      producerIdempotent?: boolean;
+      producerMaxInFlightRequests?: number;
+      producerTransactionalId?: string;
+      producerAcks?: number;
+      ensureTopicsOnConnect?: boolean;
+      topicsToEnsure?: TopicToEnsure[];
+      autoCreateDlqTopics?: boolean;
+      defaultNumPartitions?: number;
+      defaultReplicationFactor?: number;
+      retryBackoffStrategy?: 'fixed' | 'exponential';
+      retryBackoffMaxMs?: number;
+      idempotencyStore?: IdempotencyStore;
+      idempotencyKeyExtractor?: (message: KafkaMessage, topic: string) => string | null;
+      useEnvelope?: boolean;
+      validateEnvelopeOnConsume?: boolean;
     };
   }): DynamicModule {
     const { clientId, brokers, options } = params;

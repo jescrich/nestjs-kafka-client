@@ -1,11 +1,14 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { KafkaMessage } from '@nestjs/microservices/external/kafka.interface';
-import { Kafka, logLevel, ConsumerConfig, Consumer, Producer, EachBatchPayload } from 'kafkajs';
+import { Kafka, logLevel, ConsumerConfig, Consumer, Producer, EachBatchPayload, ProducerConfig } from 'kafkajs';
 import { IEventHandler } from './kafka.event.handler';
 import { cpus } from 'os';
 import { setTimeout } from 'timers/promises';
 import * as os from 'os';
 import { randomUUID } from 'crypto';
+import { MetricsCollector, KafkaMetrics } from './kafka.metrics';
+import { IdempotencyStore } from './idempotency.store';
+import { unwrapEnvelope, validateEnvelope, KafkaEnvelope } from './kafka.envelope';
 
 // Assume IEventHandler is defined elsewhere, e.g.:
 // export interface IEventHandler<T> {
@@ -36,12 +39,24 @@ interface QueueItem<T> {
   heartbeat: () => Promise<void>;
 }
 
+/**
+ * Describes a topic that should exist before the client subscribes/produces.
+ * Used by {@link KafkaClient.ensureTopics} for cold-boot topic creation.
+ */
+export interface TopicToEnsure {
+  topic: string;
+  numPartitions?: number;
+  replicationFactor?: number;
+  configEntries?: { name: string; value: string }[];
+}
+
 @Injectable()
 export class KafkaClient implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(KafkaClient.name);
   kafka: Kafka;
   private producer: Producer;
   private messageQueueSize = 0;
+  private readonly metricsCollector = new MetricsCollector();
 
   private readonly DEFAULT_MAX_CONCURRENCY = Math.max(1, Math.floor(cpus().length / 2));
   private readonly DEFAULT_BATCH_SIZE_MULTIPLIER = 10;
@@ -82,6 +97,7 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
   // For process-based CPU tracking
   private lastCpuUsage = process.cpuUsage();
   private lastCpuTime = Date.now();
+  private lastCpuPercent = 0;
 
   private cpuUsageSamples: number[] = [];
   private cpuMonitoringTimer: NodeJS.Timeout | null = null;
@@ -107,6 +123,10 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
 
   private topicPartitions: Map<string, number[]> = new Map(); // topic -> [partitionIds]
 
+  // Watchdog timers and per-consumer activity tracking
+  private watchdogTimers: NodeJS.Timeout[] = [];
+  private lastConsumerActivity = new Map<string, number>();
+
   // Configurable options
   private readonly effectiveMaxConcurrency: number;
   private readonly effectiveBatchSizeMultiplier: number;
@@ -117,7 +137,36 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
   private readonly effectiveBatchAccumulationDelayMs: number;
   private readonly effectiveMinBatchSize: number;
 
+  // Producer idempotency / transactional configuration
+  private readonly effectiveProducerIdempotent: boolean;
+  private readonly effectiveProducerMaxInFlight: number;
+  private readonly effectiveProducerTransactionalId?: string;
+  private readonly effectiveProducerAcks: number;
+
+  // ensureTopics (cold-boot) configuration
+  private readonly effectiveEnsureTopicsOnConnect: boolean;
+  private readonly effectiveTopicsToEnsure?: TopicToEnsure[];
+  private readonly effectiveAutoCreateDlqTopics: boolean;
+  private readonly effectiveDefaultNumPartitions: number;
+  private readonly effectiveDefaultReplicationFactor: number;
+
+  // Retry backoff configuration
+  private readonly effectiveRetryBackoffStrategy: 'fixed' | 'exponential';
+  private readonly effectiveRetryBackoffMaxMs: number;
+
+  // Idempotency / dedup configuration
+  private readonly effectiveIdempotencyStore?: IdempotencyStore;
+  private readonly effectiveIdempotencyKeyExtractor?: (message: KafkaMessage, topic: string) => string | null;
+
+  // Envelope configuration
+  private readonly effectiveUseEnvelope: boolean;
+  private readonly effectiveValidateEnvelope: boolean;
+
   private readonly consumers = new Map<string, Consumer>();
+
+  // Bound signal handlers so they can be removed on shutdown
+  private readonly boundSigterm = this.handleSignal.bind(this, 'SIGTERM');
+  private readonly boundSigint = this.handleSignal.bind(this, 'SIGINT');
   
   // DLQ failure recovery queue - tracks messages that failed to send to DLQ
   private readonly dlqFailureQueue = new Map<string, {
@@ -148,6 +197,26 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
       heartbeatInterval?: number;
       batchAccumulationDelayMs?: number;
       minBatchSize?: number;
+      // Producer idempotency / transactional options
+      producerIdempotent?: boolean;
+      producerMaxInFlightRequests?: number;
+      producerTransactionalId?: string;
+      producerAcks?: number;
+      // ensureTopics (cold-boot) options
+      ensureTopicsOnConnect?: boolean;
+      topicsToEnsure?: TopicToEnsure[];
+      autoCreateDlqTopics?: boolean;
+      defaultNumPartitions?: number;
+      defaultReplicationFactor?: number;
+      // Retry backoff options
+      retryBackoffStrategy?: 'fixed' | 'exponential';
+      retryBackoffMaxMs?: number;
+      // Idempotency / dedup options
+      idempotencyStore?: IdempotencyStore;
+      idempotencyKeyExtractor?: (message: KafkaMessage, topic: string) => string | null;
+      // Envelope options
+      useEnvelope?: boolean;
+      validateEnvelopeOnConsume?: boolean;
     } = {
       maxConcurrency: 0,
       batchSizeMultiplier: 0,
@@ -183,6 +252,21 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
       heartbeatInterval = 10000,
       batchAccumulationDelayMs = 100,
       minBatchSize = 5,
+      producerIdempotent = false,
+      producerMaxInFlightRequests = 5,
+      producerTransactionalId,
+      producerAcks = -1,
+      ensureTopicsOnConnect = false,
+      topicsToEnsure,
+      autoCreateDlqTopics = true,
+      defaultNumPartitions = 1,
+      defaultReplicationFactor = 1,
+      retryBackoffStrategy = 'exponential',
+      retryBackoffMaxMs = 30000,
+      idempotencyStore,
+      idempotencyKeyExtractor,
+      useEnvelope = false,
+      validateEnvelopeOnConsume = false,
     } = options;
 
     this.kafka = new Kafka({
@@ -208,13 +292,38 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
     this.effectiveBatchAccumulationDelayMs = batchAccumulationDelayMs;
     this.effectiveMinBatchSize = minBatchSize;
 
+    // Producer idempotency / transactional configuration
+    this.effectiveProducerIdempotent = producerIdempotent;
+    this.effectiveProducerMaxInFlight = producerMaxInFlightRequests;
+    this.effectiveProducerTransactionalId = producerTransactionalId;
+    this.effectiveProducerAcks = producerAcks;
+
+    // ensureTopics (cold-boot) configuration
+    this.effectiveEnsureTopicsOnConnect = ensureTopicsOnConnect;
+    this.effectiveTopicsToEnsure = topicsToEnsure;
+    this.effectiveAutoCreateDlqTopics = autoCreateDlqTopics;
+    this.effectiveDefaultNumPartitions = defaultNumPartitions;
+    this.effectiveDefaultReplicationFactor = defaultReplicationFactor;
+
+    // Retry backoff configuration
+    this.effectiveRetryBackoffStrategy = retryBackoffStrategy;
+    this.effectiveRetryBackoffMaxMs = retryBackoffMaxMs;
+
+    // Idempotency / dedup configuration
+    this.effectiveIdempotencyStore = idempotencyStore;
+    this.effectiveIdempotencyKeyExtractor = idempotencyKeyExtractor;
+
+    // Envelope configuration
+    this.effectiveUseEnvelope = useEnvelope;
+    this.effectiveValidateEnvelope = validateEnvelopeOnConsume;
+
     this.logger.log(`KafkaClient initialized with options: ${JSON.stringify(options)}`);
     // Initialize container memory limit from env vars or passed parameter
     this.initializeContainerMemoryLimit(containerMemoryLimitMB);
 
     // Graceful shutdown handlers
-    process.on('SIGTERM', this.handleSignal.bind(this, 'SIGTERM'));
-    process.on('SIGINT', this.handleSignal.bind(this, 'SIGINT'));
+    process.on('SIGTERM', this.boundSigterm);
+    process.on('SIGINT', this.boundSigint);
   }
 
   /**
@@ -273,15 +382,30 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
   private async initializeAsync(): Promise<void> {
     try {
       this.logger.log('Starting async KafkaClient initialization...');
-      
-      this.producer = this.kafka.producer();
+
+      // Build producer config, enabling idempotence / transactions when configured.
+      const producerConfig: ProducerConfig = {};
+      if (this.effectiveProducerIdempotent) {
+        producerConfig.idempotent = true;
+        producerConfig.maxInFlightRequests = this.effectiveProducerMaxInFlight;
+      }
+      if (this.effectiveProducerTransactionalId) {
+        producerConfig.transactionalId = this.effectiveProducerTransactionalId;
+        // kafkajs requires idempotence for transactional producers.
+        producerConfig.idempotent = true;
+      }
+
+      this.producer = this.kafka.producer(producerConfig);
       const connected = await this.connectWithRetry(this.producer, 'shared producer', 60000); // 1 minute timeout
-      
+
       if (!connected) {
         throw new Error('Failed to connect producer');
       }
 
-
+      // Cold-boot topic creation, if any topics were explicitly configured.
+      if (this.effectiveTopicsToEnsure?.length) {
+        await this.ensureTopics(this.effectiveTopicsToEnsure);
+      }
 
       if (this.enableCpuMonitoring) {
         this.startCpuMonitoring();
@@ -323,6 +447,10 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
     this.logger.log('Initiating graceful shutdown of Kafka client...');
 
     this.shutdownPromise = (async () => {
+      // Remove process signal listeners to avoid leaks / MaxListenersExceededWarning
+      process.removeListener('SIGTERM', this.boundSigterm);
+      process.removeListener('SIGINT', this.boundSigint);
+
       if (this.cpuMonitoringTimer) {
         clearInterval(this.cpuMonitoringTimer);
         this.cpuMonitoringTimer = null;
@@ -331,6 +459,12 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
         clearInterval(this.gcTimer);
         this.gcTimer = null;
       }
+
+      // Clear any consumer watchdog timers
+      for (const timer of this.watchdogTimers) {
+        clearInterval(timer);
+      }
+      this.watchdogTimers = [];
 
       const maxWaitMs = 30000;
       const startTime = Date.now();
@@ -350,6 +484,7 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
         );
         this.logger.log(`${this.activeConsumers.length} Kafka consumer(s) disconnected.`);
         this.activeConsumers = [];
+        this.consumers.clear();
       } catch (error) {
         this.logger.error('Error during consumer disconnection phase', error);
       }
@@ -379,15 +514,19 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`Shutdown initiated, aborting connection for ${entityName}`);
         return false;
       }
+      let timeoutHandle: NodeJS.Timeout | undefined;
       try {
         // Add connection timeout to prevent hanging
         const connectionPromise = entity.connect();
         const timeoutPromise = new Promise<never>((_, reject) => {
-          const timer = global.setTimeout(() => reject(new Error('Connection timeout')), 30000);
-          return timer;
+          timeoutHandle = global.setTimeout(() => reject(new Error('Connection timeout')), 30000);
         });
-        
-        await Promise.race([connectionPromise, timeoutPromise]);
+
+        try {
+          await Promise.race([connectionPromise, timeoutPromise]);
+        } finally {
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+        }
         this.logger.log(`${entityName} connected successfully after ${retries} retries.`);
         return true;
       } catch (error) {
@@ -440,6 +579,127 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
     return this.dynamicConcurrencyLimit;
   }
 
+  /**
+   * Runs a list of task thunks with a bounded concurrency pool that respects
+   * the current dynamic concurrency limit. Tasks are expected to handle their
+   * own errors (they do not throw), so no extra try/catch is required here.
+   */
+  private async runWithConcurrencyLimit(thunks: Array<() => Promise<void>>): Promise<void> {
+    this.messageQueueSize = thunks.length;
+    const limit = Math.max(1, this.getCurrentConcurrencyLimit());
+    let i = 0;
+    const workers = Array.from({ length: Math.min(limit, thunks.length) }, async () => {
+      while (i < thunks.length) {
+        const idx = i++;
+        await thunks[idx]();
+        this.messageQueueSize--;
+      }
+    });
+    await Promise.all(workers);
+    this.messageQueueSize = 0;
+  }
+
+  /**
+   * Ensures the given topics exist, creating any that are missing. Uses the
+   * Kafka admin client. Failures to create topics are logged but not thrown so
+   * that startup is not blocked; an admin connection failure is also captured.
+   */
+  public async ensureTopics(topics: TopicToEnsure[]): Promise<void> {
+    if (!topics || topics.length === 0) {
+      return;
+    }
+
+    const admin = this.kafka.admin();
+    try {
+      await admin.connect();
+
+      const existing = await admin.listTopics();
+      const missing = topics.filter((t) => !existing.includes(t.topic));
+
+      if (missing.length === 0) {
+        this.logger.debug(`ensureTopics: all ${topics.length} topic(s) already exist.`);
+        return;
+      }
+
+      await admin.createTopics({
+        waitForLeaders: true,
+        topics: missing.map((t) => ({
+          topic: t.topic,
+          numPartitions: t.numPartitions ?? this.effectiveDefaultNumPartitions,
+          replicationFactor: t.replicationFactor ?? this.effectiveDefaultReplicationFactor,
+          configEntries: t.configEntries,
+        })),
+      });
+
+      this.logger.log(`ensureTopics: created ${missing.length} missing topic(s): ${missing.map((t) => t.topic).join(', ')}`);
+    } catch (e) {
+      this.logger.error(`ensureTopics: failed to ensure topics: ${(e as Error).message}`, (e as Error).stack);
+    } finally {
+      await admin.disconnect().catch((e: Error) => this.logger.warn(`ensureTopics: error disconnecting admin: ${e.message}`));
+    }
+  }
+
+  /**
+   * Computes the delay before retrying a failed batch, honoring the configured
+   * backoff strategy. Exponential backoff grows with the attempt number, adds
+   * jitter, and is capped at retryBackoffMaxMs.
+   */
+  private computeBackoffDelay(attempt: number): number {
+    const base = this.effectiveMessageRetryDelayMs;
+    if (this.effectiveRetryBackoffStrategy === 'fixed') return base;
+    const exp = base * Math.pow(2, Math.max(0, attempt - 1));
+    const jitter = Math.random() * Math.min(base, 1000);
+    return Math.min(exp + jitter, this.effectiveRetryBackoffMaxMs);
+  }
+
+  /**
+   * Pauses the given topic-partition for a backoff delay and schedules a resume,
+   * so retried messages are not redelivered immediately (hot loop).
+   */
+  private scheduleRetryBackoff(consumer: Consumer, topic: string, partition: number, attempt: number): void {
+    const delay = this.computeBackoffDelay(attempt);
+    try {
+      consumer.pause([{ topic, partitions: [partition] }]);
+      const timer = global.setTimeout(() => {
+        try { consumer.resume([{ topic, partitions: [partition] }]); }
+        catch (e) { this.logger.error(`Error resuming ${topic}-${partition} after backoff: ${(e as Error).message}`); }
+      }, delay);
+      if (typeof (timer as any).unref === 'function') (timer as any).unref();
+      this.logger.warn(`Retry backoff: paused ${topic}-${partition} for ${Math.round(delay)}ms (attempt ${attempt})`);
+    } catch (e) {
+      this.logger.error(`Error scheduling retry backoff for ${topic}-${partition}: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Parses a Kafka message value, optionally unwrapping/validating an envelope,
+   * and resolves the idempotency id from (in order) a configured extractor, the
+   * envelope eventId, or the x-message-id / x-event-id headers.
+   */
+  private resolveEvent(message: KafkaMessage, topic: string): { event: any; idempotencyId: string | null } {
+    let parsed = JSON.parse(message.value!.toString());
+    let envelopeId: string | null = null;
+    if (this.effectiveUseEnvelope) {
+      if (this.effectiveValidateEnvelope) {
+        const v = validateEnvelope(parsed);
+        if (!v.valid) throw new Error(`Invalid envelope for ${topic} offset ${message.offset}: ${v.errors.join('; ')}`);
+      }
+      const { envelope, payload } = unwrapEnvelope(parsed);
+      if (envelope) envelopeId = envelope.eventId;
+      parsed = payload;
+    }
+    let idempotencyId: string | null = null;
+    if (this.effectiveIdempotencyKeyExtractor) {
+      idempotencyId = this.effectiveIdempotencyKeyExtractor(message, topic);
+    } else if (envelopeId) {
+      idempotencyId = envelopeId;
+    } else {
+      const h = message.headers?.['x-message-id'] ?? message.headers?.['x-event-id'];
+      idempotencyId = h != null ? h.toString() : null;
+    }
+    return { event: parsed, idempotencyId };
+  }
+
   async produce<T>(topic: string, key: string, event: T): Promise<void> {
     if (this.isShuttingDown) {
       this.logger.warn(`Shutting down, skipping produce message to topic ${topic}`);
@@ -457,10 +717,11 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
     try {
       await this.producer.send({
         topic,
+        acks: this.effectiveProducerAcks,
         messages: [{ key, value: JSON.stringify(event) }],
       });
 
-
+      this.metricsCollector.incrementProduced();
 
       this.logger.debug(`Event dispatched to topic ${topic}, key ${key}`);
     } catch (e) {
@@ -477,7 +738,8 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
     try {
       await this.producer.send({
         topic: dlqTopic,
-        messages: [{ 
+        acks: this.effectiveProducerAcks,
+        messages: [{
           key: message.key, 
           value: message.value, 
           headers: {
@@ -669,11 +931,35 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
       throw new Error(`Failed to connect consumer for group ${groupId}`);
     }
     
+    // Register the connected consumer so shutdown can disconnect it for real.
+    this.activeConsumers.push(consumer);
+
+    // Cold-boot: ensure subscribed topics (and optionally their DLQ topics) exist.
+    if (this.effectiveEnsureTopicsOnConnect) {
+      try {
+        const toEnsure: TopicToEnsure[] = [];
+        for (const topic of topicsToSubscribe) {
+          toEnsure.push({ topic });
+          if (this.effectiveAutoCreateDlqTopics) {
+            toEnsure.push({ topic: `${topic}${this.effectiveDlqSuffix}` });
+          }
+        }
+        await this.ensureTopics(toEnsure);
+      } catch (error) {
+        this.logger.warn(`ensureTopicsOnConnect failed for group ${groupId}, continuing to subscribe: ${(error as Error).message}`);
+      }
+    }
+
     try {
       await consumer.subscribe({ topics: topicsToSubscribe, fromBeginning: this.effectiveFromBeginning });
     } catch (error) {
       this.logger.error(`Failed to subscribe to topics for group ${groupId}: ${error.message}`);
       throw error;
+    }
+
+    // Register each subscribed topic so backpressure (pause/resume) has real targets.
+    for (const topic of topicsToSubscribe) {
+      this.consumerRegistry.set(topic, consumer);
     }
 
     await consumer.run({
@@ -682,6 +968,19 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
         if (!isRunning() || isStale() || this.isShuttingDown) {
           return;
         }
+
+        // Count this batch as an in-flight processor so shutdown can drain it.
+        this.activeProcessors++;
+
+        // Register the partition seen for this topic so backpressure can target it.
+        const parts = this.topicPartitions.get(batch.topic) ?? [];
+        if (!parts.includes(batch.partition)) {
+          parts.push(batch.partition);
+          this.topicPartitions.set(batch.topic, parts);
+        }
+
+        // Record consumer activity for the watchdog.
+        this.lastConsumerActivity.set(`${batch.topic}-${groupId}`, Date.now());
 
         // Configuration for batch processing limits
         const MAX_BATCH_SIZE = 100; // Maximum messages per batch
@@ -707,6 +1006,9 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
           // Send initial heartbeat
           await heartbeat();
 
+          // Track consumed messages
+          this.metricsCollector.incrementConsumed(batch.messages.length);
+
           // Group messages by key to process them in batches.
           const messagesByKey = new Map<string, KafkaMessage[]>();
           for (const message of batch.messages) {
@@ -717,7 +1019,7 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
             messagesByKey.get(key)!.push(message);
           }
 
-          const processingPromises: Promise<void>[] = [];
+          const taskThunks: Array<() => Promise<void>> = [];
           const successfulMessages: KafkaMessage[] = [];
           const failedMessages: KafkaMessage[] = [];
 
@@ -759,15 +1061,41 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
                   }
 
                   if (chunk.length > 1 && handler.handleBatch) {
-                    // Process as a batch
-                    const events = chunk.map(m => JSON.parse(m.value!.toString()));
-                    await handler.handleBatch({ key, events, payloads: chunk as any[] });
-                  } else {
-                    // Process messages individually
-                    for (const message of chunk) {
-                      const event = JSON.parse(message.value!.toString());
-                      await handler.handle?.({ key, event, payload: message as any });
+                    // Process as a batch, resolving envelopes and skipping duplicates.
+                    const resolved = chunk.map(m => ({ m, ...this.resolveEvent(m, batch.topic) }));
+                    const fresh = [];
+                    for (const r of resolved) {
+                      if (r.idempotencyId && this.effectiveIdempotencyStore && await this.effectiveIdempotencyStore.isProcessed(r.idempotencyId)) {
+                        this.logger.debug(`Skipping duplicate message ${r.idempotencyId} on ${batch.topic}`);
+                        continue;
+                      }
+                      fresh.push(r);
                     }
+                    if (fresh.length > 0) {
+                      await handler.handleBatch({ key, events: fresh.map(r => r.event), payloads: fresh.map(r => r.m) as any[] });
+                      for (const r of fresh) {
+                        if (r.idempotencyId && this.effectiveIdempotencyStore) await this.effectiveIdempotencyStore.markProcessed(r.idempotencyId);
+                      }
+                    }
+                    this.metricsCollector.recordBatch(fresh.length, fresh.length < this.effectiveMinBatchSize);
+                    this.metricsCollector.incrementProcessed(fresh.length, true);
+                    this.metricsCollector.recordBatchProcessingTime(Date.now() - taskStartTime);
+                  } else {
+                    // Process messages individually, resolving envelopes and skipping duplicates.
+                    for (const message of chunk) {
+                      const { event, idempotencyId } = this.resolveEvent(message, batch.topic);
+                      if (idempotencyId && this.effectiveIdempotencyStore && await this.effectiveIdempotencyStore.isProcessed(idempotencyId)) {
+                        this.logger.debug(`Skipping duplicate message ${idempotencyId} on ${batch.topic}`);
+                        continue;
+                      }
+                      await handler.handle?.({ key, event, payload: message as any });
+                      if (idempotencyId && this.effectiveIdempotencyStore) {
+                        await this.effectiveIdempotencyStore.markProcessed(idempotencyId);
+                      }
+                    }
+
+                    // Track individual processing
+                    this.metricsCollector.incrementProcessed(chunk.length, false);
                   }
                   
 
@@ -775,6 +1103,7 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
                   // Track processing time
                   const processingTime = Date.now() - taskStartTime;
                   this.trackProcessingTime(processingTime / chunk.length);
+                  this.metricsCollector.recordProcessingTime(processingTime / chunk.length);
                   
                   // Add to successful messages for offset commit
                   successfulMessages.push(...chunk);
@@ -827,6 +1156,18 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
                     this.logger.warn(`Retrying ${messagesToRetry.length} messages for key ${key} (retries remaining)`);
 
                     failedMessages.push(...messagesToRetry);
+                    // Track failed messages and retry attempts
+                    this.metricsCollector.incrementFailed(messagesToRetry.length);
+                    this.metricsCollector.incrementRetries(messagesToRetry.length);
+
+                    // Apply backoff before these offsets are redelivered.
+                    let maxAttempt = 0;
+                    for (const message of messagesToRetry) {
+                      const retryKey = `${batch.topic}-${batch.partition}-${message.offset}`;
+                      const attempt = retryTracker.get(retryKey) || 0;
+                      if (attempt > maxAttempt) maxAttempt = attempt;
+                    }
+                    this.scheduleRetryBackoff(consumer, batch.topic, batch.partition, maxAttempt);
                   }
                   
                   if (messagesToDlq.length > 0) {
@@ -838,6 +1179,9 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
                       for (const message of messagesToDlq) {
                         await this.sendToDeadLetterQueue(batch.topic, message, batch.partition);
                       }
+                      
+                      // Track DLQ messages
+                      this.metricsCollector.incrementDlq(messagesToDlq.length);
                       
                       // Add to successful messages so offsets are committed (preventing redelivery)
                       successfulMessages.push(...messagesToDlq);
@@ -854,6 +1198,9 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
                       // Don't commit their offsets - they'll be retried later
                       failedMessages.push(...messagesToDlq);
                       
+                      // Track failed messages
+                      this.metricsCollector.incrementFailed(messagesToDlq.length);
+                      
                       // Log critical situation
                       this.logger.error(`CRITICAL: ${messagesToDlq.length} messages failed to send to DLQ and are queued for retry. Offsets will not be committed to prevent data loss.`);
                     }
@@ -861,7 +1208,7 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
                 }
               };
 
-              processingPromises.push(task());
+              taskThunks.push(task);
             }
           }
 
@@ -869,9 +1216,9 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
             // Retry any failed DLQ sends before processing new messages
             await this.retryDlqFailures();
             
-            // Wait for all key-based tasks to complete
+            // Wait for all key-based tasks to complete, capped by the dynamic concurrency limit.
             // Note: tasks handle their own errors and don't throw
-            await Promise.all(processingPromises);
+            await this.runWithConcurrencyLimit(taskThunks);
 
             // Send final heartbeat before committing
             await heartbeat();
@@ -883,11 +1230,12 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
                 .sort((a, b) => parseInt(a.offset, 10) - parseInt(b.offset, 10));
               
               // Find the highest contiguous successful offset
+              const successfulSet = new Set(successfulMessages);
               let commitOffset = parseInt(allMessages[0].offset, 10);
-              
+
               for (const message of allMessages) {
                 const offset = parseInt(message.offset, 10);
-                if (successfulMessages.includes(message) && offset === commitOffset) {
+                if (successfulSet.has(message) && offset === commitOffset) {
                   commitOffset = offset + 1;
                 } else {
                   break; // Stop at first gap or failed message
@@ -919,9 +1267,13 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
         } finally {
           // Always clear the heartbeat timer
           clearInterval(heartbeatTimer);
+          this.activeProcessors--;
         }
       },
     });
+
+    // Start the idle watchdog now that the consumer is running.
+    this.startConsumerWatchdog(groupId, consumer);
   }
 
   /**
@@ -929,12 +1281,10 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
    */
   private isRetryableError(error: any): boolean {
     // Network and connection errors are usually retryable
-    if (error.code === 'ECONNRESET' || 
-        error.code === 'ECONNREFUSED' || 
+    if (error.code === 'ECONNRESET' ||
+        error.code === 'ECONNREFUSED' ||
         error.code === 'ETIMEDOUT' ||
-        error.message?.includes('timeout') ||
-        error.message?.includes('connection') ||
-        error.message?.includes('network')) {
+        error.message?.includes('timeout')) {
       return true;
     }
     
@@ -973,6 +1323,45 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
       isInitialized: this.isInitialized,
       error: this.initializationError?.message || null,
     };
+  }
+
+  /**
+   * Get comprehensive metrics about Kafka client operations
+   * 
+   * Returns metrics including:
+   * - Message counters (consumed, processed, failed, DLQ)
+   * - Performance metrics (processing times)
+   * - Batch efficiency metrics
+   * - Resource usage (CPU, memory)
+   * - Queue status
+   * - Connection status
+   * 
+   * @returns {KafkaMetrics} Current metrics snapshot
+   */
+  public getMetrics(): KafkaMetrics {
+    return this.metricsCollector.getMetrics({
+      getMemoryUsage: () => {
+        const memUsage = this.getContainerMemoryUsage();
+        return {
+          currentPercent: memUsage.usedPercent,
+          rssBytes: memUsage.rssBytes,
+          limitBytes: this.containerMemoryLimitBytes,
+          isCritical: this.isMemoryCritical,
+        };
+      },
+      getCpuUsage: () => {
+        return {
+          currentPercent: this.lastCpuPercent,
+          avgPercent: this.getAverageCpuUsage(),
+          isCritical: this.isCpuCritical,
+        };
+      },
+      getQueueSize: () => this.messageQueueSize,
+      getMaxQueueSize: () => this.getMaxQueueSize(),
+      isConnected: () => this.isInitialized,
+      getActiveProcessors: () => this.activeProcessors,
+      getConcurrencyLimit: () => this.dynamicConcurrencyLimit,
+    });
   }
 
   async isHealthy(): Promise<boolean> {
@@ -1028,6 +1417,7 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
 
     // Take initial sample
     const initialCpuUsage = this.getContainerCpuUsage();
+    this.lastCpuPercent = initialCpuUsage;
     this.cpuUsageSamples.push(initialCpuUsage);
 
 
@@ -1039,6 +1429,7 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
 
       try {
         const currentCpu = this.getContainerCpuUsage();
+        this.lastCpuPercent = currentCpu;
         this.cpuUsageSamples.push(currentCpu);
         if (this.cpuUsageSamples.length > this.CPU_SAMPLES_TO_KEEP) {
           this.cpuUsageSamples.shift();
@@ -1364,16 +1755,15 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
     const WATCHDOG_INTERVAL_MS = 300000; // 5 minutes (increased from 1 minute)
     const MAX_IDLE_TIME_MS = 900000; // 15 minutes (increased from 5 minutes)
 
-    const lastMessageTime = new Map<string, number>();
     let hasLoggedIdleWarning = new Map<string, boolean>();
 
-    setInterval(() => {
+    const watchdogTimer = setInterval(() => {
       if (this.isShuttingDown) return;
 
       const now = Date.now();
       this.topicPartitions.forEach((partitions, topic) => {
         const topicKey = `${topic}-${groupId}`;
-        const lastMsgTime = lastMessageTime.get(topicKey) || now;
+        const lastMsgTime = this.lastConsumerActivity.get(topicKey) || now;
         const idleTimeMs = now - lastMsgTime;
 
         // If no messages have been processed for too long
@@ -1392,7 +1782,7 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
               if (!healthy) {
                 this.logger.error(`Consumer appears unhealthy after ${Math.round(idleTimeMs / 1000 / 60)} minutes of inactivity. Attempting to restart consumer for ${groupId}`);
                 this.restartConsumer(groupId, consumer);
-                lastMessageTime.set(topicKey, Date.now());
+                this.lastConsumerActivity.set(topicKey, Date.now());
                 hasLoggedIdleWarning.set(topicKey, false);
               }
             });
@@ -1407,8 +1797,7 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
       });
     }, WATCHDOG_INTERVAL_MS);
 
-    // Update last message time whenever a message is processed
-    // Add this to the message processing logic
+    this.watchdogTimers.push(watchdogTimer);
   }
 
   private restartConsumer(groupId: string, consumer: Consumer): void {
