@@ -152,6 +152,78 @@ describe('KafkaClient new features', () => {
     });
   });
 
+  describe('produce with headers', () => {
+    it('forwards headers on the message', async () => {
+      kafkaClient = new KafkaClient('hdr-client', 'localhost:9092', {});
+      await kafkaClient.initialize();
+
+      await kafkaClient.produce('topic-h', 'key-h', { hello: 'world' }, {
+        headers: { tenant: 'acme', traceparent: '00-abc' },
+      });
+
+      expect(mockProducer.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          topic: 'topic-h',
+          messages: [
+            expect.objectContaining({
+              key: 'key-h',
+              value: JSON.stringify({ hello: 'world' }),
+              headers: { tenant: 'acme', traceparent: '00-abc' },
+            }),
+          ],
+        }),
+      );
+    });
+  });
+
+  describe('send (low-level, header-aware)', () => {
+    it('sends a pre-serialized value with headers verbatim and default acks', async () => {
+      kafkaClient = new KafkaClient('send-client', 'localhost:9092', {});
+      await kafkaClient.initialize();
+
+      const value = JSON.stringify({ event_type: 'order.created', tenant: 'acme' });
+      await kafkaClient.send({
+        topic: 'orders',
+        messages: [{ key: 'urn:order:1', value, headers: { tenant: 'acme' } }],
+      });
+
+      expect(mockProducer.send).toHaveBeenCalledWith({
+        topic: 'orders',
+        acks: -1,
+        messages: [{ key: 'urn:order:1', value, headers: { tenant: 'acme' } }],
+      });
+    });
+
+    it('honors a per-call acks override and counts produced messages', async () => {
+      kafkaClient = new KafkaClient('send-client2', 'localhost:9092', {});
+      await kafkaClient.initialize();
+
+      await kafkaClient.send({
+        topic: 'orders',
+        acks: 1,
+        messages: [
+          { key: 'a', value: 'v1' },
+          { key: 'b', value: 'v2' },
+        ],
+      });
+
+      expect(mockProducer.send).toHaveBeenCalledWith(
+        expect.objectContaining({ topic: 'orders', acks: 1 }),
+      );
+      expect(kafkaClient.getMetrics().producedMessages).toBe(2);
+    });
+
+    it('rejects when the client is shutting down', async () => {
+      kafkaClient = new KafkaClient('send-client3', 'localhost:9092', {});
+      await kafkaClient.initialize();
+      await kafkaClient.shutdown();
+
+      await expect(
+        kafkaClient.send({ topic: 'orders', messages: [{ key: 'a', value: 'v' }] }),
+      ).rejects.toThrow('Client is shutting down');
+    });
+  });
+
   describe('ensureTopics', () => {
     it('creates only the missing topics with default partitions/replication', async () => {
       mockAdmin.listTopics.mockResolvedValue(['a']);

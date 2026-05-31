@@ -700,25 +700,30 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
     return { event: parsed, idempotencyId };
   }
 
-  async produce<T>(topic: string, key: string, event: T): Promise<void> {
+  async produce<T>(
+    topic: string,
+    key: string,
+    event: T,
+    options?: { headers?: Record<string, string | Buffer | undefined> },
+  ): Promise<void> {
     if (this.isShuttingDown) {
       this.logger.warn(`Shutting down, skipping produce message to topic ${topic}`);
       throw new Error('Client is shutting down, cannot produce message.');
     }
-    
+
     if (!this.isInitialized) {
-      const error = this.initializationError 
+      const error = this.initializationError
         ? `KafkaClient not initialized: ${this.initializationError.message}`
         : 'KafkaClient not initialized yet';
       this.logger.error(`Cannot produce message to topic ${topic}: ${error}`);
       throw new Error(error);
     }
-    
+
     try {
       await this.producer.send({
         topic,
         acks: this.effectiveProducerAcks,
-        messages: [{ key, value: JSON.stringify(event) }],
+        messages: [{ key, value: JSON.stringify(event), headers: options?.headers }],
       });
 
       this.metricsCollector.incrementProduced();
@@ -729,6 +734,54 @@ export class KafkaClient implements OnModuleInit, OnModuleDestroy {
       // Depending on the error, you might want to retry or ensure producer is reconnected.
       // For now, rethrowing.
       throw new Error(`Error dispatching event. Key: ${key}, Topic: ${topic}. Error: ${e.message}`);
+    }
+  }
+
+  /**
+   * Low-level send mirroring kafkajs' `ProducerRecord`. Unlike {@link produce}, the
+   * caller supplies the message(s) verbatim — a pre-serialized `value` plus `key`,
+   * `headers` and optional `partition`. Use this when a header-carrying contract must
+   * reach the broker (e.g. an event envelope whose `tenant` header drives a consumer-side
+   * tenant check). Applies the same lifecycle guards, default `acks` and produced-metric
+   * as {@link produce}, and structurally satisfies a duck-typed producer interface.
+   */
+  public async send(record: {
+    topic: string;
+    messages: Array<{
+      key?: string | Buffer | null;
+      value: string | Buffer | null;
+      headers?: Record<string, string | Buffer | undefined>;
+      partition?: number;
+      timestamp?: string;
+    }>;
+    acks?: number;
+  }): Promise<void> {
+    if (this.isShuttingDown) {
+      this.logger.warn(`Shutting down, skipping send to topic ${record.topic}`);
+      throw new Error('Client is shutting down, cannot produce message.');
+    }
+
+    if (!this.isInitialized) {
+      const error = this.initializationError
+        ? `KafkaClient not initialized: ${this.initializationError.message}`
+        : 'KafkaClient not initialized yet';
+      this.logger.error(`Cannot send to topic ${record.topic}: ${error}`);
+      throw new Error(error);
+    }
+
+    try {
+      await this.producer.send({
+        topic: record.topic,
+        acks: record.acks ?? this.effectiveProducerAcks,
+        messages: record.messages,
+      });
+
+      this.metricsCollector.incrementProduced(record.messages.length);
+
+      this.logger.debug(`Sent ${record.messages.length} message(s) to topic ${record.topic}`);
+    } catch (e) {
+      this.logger.error(`Error sending to topic ${record.topic}: ${e.message}`, e.stack);
+      throw new Error(`Error dispatching event. Topic: ${record.topic}. Error: ${e.message}`);
     }
   }
 
