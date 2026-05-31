@@ -1,6 +1,6 @@
 {
   "name": "@jescrich/nestjs-kafka-client",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "NestJS Kafka Client and Consumer",
   "license": "MIT",
   "author": "José Escrich",
@@ -52,7 +52,6 @@
     "rxjs": "^7.8.2"
   },
   "devDependencies": {
-    "kafkajs": "^2.2.4",
     "@golevelup/ts-jest": "^0.7.0",
     "@nestjs/cli": "^11.0.10",
     "@nestjs/testing": "^11.1.6",
@@ -66,6 +65,7 @@
     "eslint-config-prettier": "^10.1.5",
     "eslint-plugin-prettier": "^5.5.4",
     "jest": "^30.0.5",
+    "kafkajs": "^2.2.4",
     "prettier": "^3.5.3",
     "ts-jest": "^29.4.1",
     "ts-node": "^10.9.1",
