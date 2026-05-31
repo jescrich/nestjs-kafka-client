@@ -9,6 +9,18 @@ export interface IdempotencyStore {
   isProcessed(messageId: string): Promise<boolean>;
   /** Marks messageId as processed. An optional ttlMs overrides the default TTL. */
   markProcessed(messageId: string, ttlMs?: number): Promise<void>;
+  /**
+   * Atomically claim `messageId`: returns `true` when it was NEW (caller should process)
+   * or `false` when it was already seen (a duplicate — caller should skip). This is the
+   * single-operation form of `isProcessed` + `markProcessed`, and the only variant that is
+   * safe for a *shared* (multi-pod) store, where a separate check-then-mark would race two
+   * instances into both processing the same message.
+   *
+   * Optional for backward compatibility: a consumer that wants mark-after-success semantics
+   * keeps using `isProcessed`/`markProcessed`. Mirrors `@nexa/messaging`'s
+   * `IIdempotencyGuard.markIfNew`, so a Mongo-unique-index guard satisfies this 1:1.
+   */
+  markIfNew?(messageId: string, ttlMs?: number): Promise<boolean>;
 }
 
 /**
@@ -78,6 +90,25 @@ export class InMemoryIdempotencyStore implements IdempotencyStore {
    * exceeds maxEntries, the oldest inserted entry is evicted.
    */
   async markProcessed(messageId: string, ttlMs?: number): Promise<void> {
+    this.set(messageId, ttlMs);
+  }
+
+  /**
+   * Atomically claim `messageId`. Returns true when newly claimed, false when it was already
+   * live. The check and the set run with no intervening `await`, so within this single-threaded
+   * process there is no window for a concurrent claim to slip through.
+   */
+  async markIfNew(messageId: string, ttlMs?: number): Promise<boolean> {
+    const expiresAt = this.store.get(messageId);
+    if (expiresAt !== undefined && Date.now() < expiresAt) {
+      return false;
+    }
+    this.set(messageId, ttlMs);
+    return true;
+  }
+
+  /** Synchronous insert with recency re-ordering + max-entries eviction. */
+  private set(messageId: string, ttlMs?: number): void {
     const expiresAt = Date.now() + (ttlMs ?? this.ttlMs);
 
     // Re-insert to move the key to the most-recent position (recency ordering).

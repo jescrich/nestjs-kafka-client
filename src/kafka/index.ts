@@ -4,4 +4,6 @@ export * from './kafka.client.module';
 export * from './kafka.connection.manager';
 export * from './kafka.health';
 export * from './idempotency.store';
+export * from './redis.idempotency.store';
 export * from './kafka.envelope';
+export * from './kafka.topics';

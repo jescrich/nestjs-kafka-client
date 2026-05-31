@@ -76,4 +76,18 @@ describe('InMemoryIdempotencyStore', () => {
     await expect(store.isProcessed('b')).resolves.toBe(false);
     expect(store.size()).toBe(1);
   });
+
+  it('markIfNew claims an id once, then reports duplicates', async () => {
+    store = new InMemoryIdempotencyStore();
+    await expect(store.markIfNew('a')).resolves.toBe(true);
+    await expect(store.markIfNew('a')).resolves.toBe(false);
+    await expect(store.isProcessed('a')).resolves.toBe(true);
+  });
+
+  it('markIfNew re-claims an id after its TTL expires', async () => {
+    store = new InMemoryIdempotencyStore();
+    await expect(store.markIfNew('a', 40)).resolves.toBe(true);
+    await new Promise((r) => setTimeout(r, 70));
+    await expect(store.markIfNew('a', 40)).resolves.toBe(true);
+  });
 });

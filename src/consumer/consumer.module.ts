@@ -13,6 +13,10 @@ export class ConsumerModule {
     brokers: string;
     providers?: Type<any>[];
     consumers: Type<any>[];
+    /** When set, every consumer is registered once per tenant on its own consumer group. */
+    tenants?: string[];
+    /** Consumer-group template, supports `{tenant}` and `{name}` placeholders. */
+    groupId?: string;
     options?: {
       maxConcurrency?: number;
       batchSizeMultiplier?: number;
@@ -72,7 +76,10 @@ export class ConsumerModule {
           provide: ConsumerService,
           useFactory: (kafkaClient: KafkaClient, consumerRef: ConsumerRefService, moduleRef: ModuleRef) => {
             Logger.log('ConsumerService moduleref ' + moduleRef, 'ConsumerService');
-            return new ConsumerService(params.name, kafkaClient, consumerRef, moduleRef);
+            return new ConsumerService(params.name, kafkaClient, consumerRef, moduleRef, {
+              tenants: params.tenants,
+              groupId: params.groupId,
+            });
           },
           inject: [KafkaClient, ConsumerRefService, ModuleRef],
         },

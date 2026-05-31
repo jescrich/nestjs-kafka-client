@@ -31,8 +31,14 @@
     "@nestjs/core": "^11.0.1",
     "@nestjs/microservices": "^11.0.1",
     "@nestjs/terminus": "^10.0.1",
+    "kafkajs": "^2.2.4",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"
+  },
+  "peerDependenciesMeta": {
+    "@nestjs/terminus": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@nestjs/common": "^11.1.6",
@@ -41,12 +47,12 @@
     "@nestjs/terminus": "^11.0.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.2",
-    "kafkajs": "^2.2.4",
     "lodash": "^4.17.15",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"
   },
   "devDependencies": {
+    "kafkajs": "^2.2.4",
     "@golevelup/ts-jest": "^0.7.0",
     "@nestjs/cli": "^11.0.10",
     "@nestjs/testing": "^11.1.6",

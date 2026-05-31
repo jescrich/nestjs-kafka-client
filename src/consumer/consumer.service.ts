@@ -1,9 +1,24 @@
-import { IEventHandler, KafkaClient } from '@this/kafka';
+import { IEventHandler, KafkaClient, KafkaTopics } from '@this/kafka';
 import { ConsumerDef } from './consumer.def';
 import { ExecutionContext, Injectable, Logger, OnModuleInit, Type } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import { Consumer } from '..';
 import { ConsumerRefService } from './consumer.ref';
+
+/**
+ * Optional multi-tenant fan-out. When `tenants` is set, every `@Handler` is registered once per
+ * tenant: the `{tenant}` placeholder in its topic is substituted, and each tenant gets its own
+ * consumer group (so offsets and rebalances are isolated per tenant).
+ */
+export interface ConsumerServiceOptions {
+  /** Tenants to fan out across. Omit (or empty) for the classic single-group behavior. */
+  tenants?: string[];
+  /**
+   * Consumer-group template. Supports `{tenant}` and `{name}` placeholders. Defaults:
+   * `{name}-consumer` (single-group) or `{tenant}.{name}` (per-tenant).
+   */
+  groupId?: string;
+}
 
 @Injectable()
 export class ConsumerService implements OnModuleInit {
@@ -11,12 +26,13 @@ export class ConsumerService implements OnModuleInit {
   private isInitialized = false;
   private initializationError: Error | null = null;
   private consumerDefinitions: ConsumerDef<any>[] = [];
-  
+
   constructor(
     private readonly name: string,
     private readonly kafkaClient: KafkaClient,
     private readonly consumerRef: ConsumerRefService,
     private readonly moduleRef: ModuleRef,
+    private readonly options?: ConsumerServiceOptions,
   ) {
     this.logger.log(`Initializing consumer ${this.name}`);
   }
@@ -130,23 +146,36 @@ export class ConsumerService implements OnModuleInit {
   }
 
   async consume<T>(definition: ConsumerDef<T>): Promise<void> {
-    const { name, kafkaClient } = this;
-    const groupId = `${name}-consumer`;
-    const { topic, handler } = definition;
-
-    return await kafkaClient.consumeMany([{ topic, handler }], groupId);
+    return this.consumeMany([definition]);
   }
-  
+
   async consumeMany(definitions: ConsumerDef<any>[]): Promise<void> {
-    const { name, kafkaClient } = this;
-    const groupId = `${name}-consumer`;
+    const tenants = this.options?.tenants;
 
-    // Transform definitions to the format expected by kafkaClient.consumeMany
-    const topicHandlers = definitions.map(({ topic, handler }) => ({
-      topic,
-      handler,
-    }));
+    // Classic single-group behavior when no tenants are configured.
+    if (!tenants || tenants.length === 0) {
+      const topicHandlers = definitions.map(({ topic, handler }) => ({ topic, handler }));
+      return await this.kafkaClient.consumeMany<any>(topicHandlers, this.resolveGroupId());
+    }
 
-    return await kafkaClient.consumeMany<any>(topicHandlers, groupId);
+    // Per-tenant fan-out: one consumer group per tenant, with `{tenant}` substituted in topics.
+    for (const tenant of tenants) {
+      const groupId = this.resolveGroupId(tenant);
+      const topicHandlers = definitions.map(({ topic, handler }) => ({
+        topic: KafkaTopics.withTenant(topic, tenant),
+        handler,
+      }));
+      this.logger.log(
+        `Registering ${topicHandlers.length} handler(s) for tenant "${tenant}" on group ${groupId}`,
+      );
+      await this.kafkaClient.consumeMany<any>(topicHandlers, groupId);
+    }
+  }
+
+  /** Resolve the consumer-group id from the configured template (or the defaults). */
+  private resolveGroupId(tenant?: string): string {
+    const template =
+      this.options?.groupId ?? (tenant !== undefined ? '{tenant}.{name}' : '{name}-consumer');
+    return template.replace(/\{tenant\}/g, tenant ?? '').replace(/\{name\}/g, this.name);
   }
 }
