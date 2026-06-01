@@ -1,6 +1,6 @@
 {
   "name": "@jescrich/nestjs-kafka-client",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "NestJS Kafka Client and Consumer",
   "license": "MIT",
   "author": "José Escrich",
